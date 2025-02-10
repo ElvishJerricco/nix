@@ -4,6 +4,7 @@
 
 , boost
 , brotli
+, fsverity-utils
 , libarchive
 , libcpuid
 , libsodium
@@ -41,6 +42,7 @@ mkMesonLibrary (finalAttrs: {
 
   buildInputs = [
     brotli
+    fsverity-utils
     libsodium
     openssl
   ] ++ lib.optional stdenv.hostPlatform.isx86_64 libcpuid

@@ -62,6 +62,12 @@ elif host_machine.system() == 'sunos'
   deps_other += [socket, network_service_library]
 endif
 
+libfsverity = dependency(
+  'libfsverity',
+  version: '>= 1.6',
+)
+deps_private += libfsverity
+
 boost = dependency(
   'boost',
   modules : ['context', 'coroutine'],

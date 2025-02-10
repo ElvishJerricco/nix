@@ -1138,6 +1138,10 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source,
 
                 optimisePath(realPath, repair); // FIXME: combine with hashPath()
 
+                if (settings.fsverityStorePaths) {
+                    fsverityEnable(realPath);
+                }
+
                 if (settings.fsyncStorePaths) {
                     recursiveSync(realPath);
                     syncParent(realPath);
@@ -1298,6 +1302,10 @@ StorePath LocalStore::addToStoreFromDump(
             canonicalisePathMetaData(realPath); // FIXME: merge into restorePath
 
             optimisePath(realPath, repair);
+
+            if (settings.fsverityStorePaths) {
+                fsverityEnable(realPath);
+            }
 
             if (settings.fsyncStorePaths) {
                 recursiveSync(realPath);

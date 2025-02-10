@@ -369,6 +369,44 @@ void recursiveSync(const Path & path)
 }
 
 
+void fsverityEnable(const Path & path)
+{
+    /* If it's a file or symlink, just enable verity and return. */
+    auto st = lstat(path);
+    if (S_ISREG(st.st_mode)) {
+        AutoCloseFD fd = toDescriptor(open(path.c_str(), O_RDONLY, 0));
+        if (!fd)
+            throw SysError("opening file '%1%'", path);
+        debug("fsverity: %1%", path);
+        fd.fsverity();
+        return;
+    } else if (S_ISLNK(st.st_mode))
+        return;
+
+    /* Otherwise, perform a depth-first traversal of the directory and
+       fsync all the files. */
+    std::deque<fs::path> dirsToEnumerate;
+    dirsToEnumerate.push_back(path);
+    while (!dirsToEnumerate.empty()) {
+        auto currentDir = dirsToEnumerate.back();
+        dirsToEnumerate.pop_back();
+        for (auto & entry : std::filesystem::directory_iterator(currentDir)) {
+            auto st = entry.symlink_status();
+            if (fs::is_directory(st)) {
+                dirsToEnumerate.emplace_back(entry.path());
+            } else if (fs::is_regular_file(st)) {
+                auto st = lstat(entry.path());
+                debug("fsverity inner loop: %1%", entry.path());
+                AutoCloseFD fd = toDescriptor(open(entry.path().string().c_str(), O_RDONLY, 0));
+                if (!fd)
+                    throw SysError("opening file '%1%'", entry.path());
+                fd.fsverity();
+            }
+        }
+    }
+}
+
+
 static void _deletePath(Descriptor parentfd, const fs::path & path, uint64_t & bytesFreed)
 {
 #ifndef _WIN32

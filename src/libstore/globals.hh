@@ -406,6 +406,13 @@ public:
           but reduces performance. The default is `false`.
         )"};
 
+    Setting<bool> fsverityStorePaths{this, false, "fsverity-store-paths",
+        R"(
+          Whether to enable fs-verity on store paths before registering them.
+          This setting has no effect if the underlying file system or kernel does
+          not support fs-verity. The default is `false`.
+        )"};
+
     Setting<bool> useSQLiteWAL{this, !isWSL1(), "use-sqlite-wal",
         "Whether SQLite should use WAL mode."};
 

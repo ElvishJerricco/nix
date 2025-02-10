@@ -6,6 +6,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <libfsverity.h>
 #ifdef _WIN32
 # include <winnt.h>
 # include <fileapi.h>
@@ -121,6 +122,26 @@ void AutoCloseFD::startFsync() const
             /* Ignore failure, since fsync must be run later anyway. This is just a performance optimization. */
             ::sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
         }
+#endif
+}
+
+void AutoCloseFD::fsverity() const
+{
+#if __linux__
+    if (fd != -1) {
+        int result;
+        struct libfsverity_merkle_tree_params params;
+        params.version = 1;
+        params.hash_algorithm = FS_VERITY_HASH_ALG_SHA256;
+        params.file_size = 0; // unused
+        params.block_size = 0; // default
+        params.salt_size = 0;
+        params.salt = NULL;
+        params.metadata_callbacks = NULL; // unused
+        result = libfsverity_enable(fd, &params);
+        if (result && result != -EEXIST && result != -ENOTTY && result != EOPNOTSUPP)
+            throw SysError(-result, "enabling fsverity");
+    }
 #endif
 }
 

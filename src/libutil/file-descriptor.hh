@@ -175,6 +175,11 @@ public:
      * fsync must be run later even if this is called.
      */
     void startFsync() const;
+
+    /**
+     * Enable fsverity on the file, if supported.
+     */
+    void fsverity() const;
 };
 
 class Pipe
