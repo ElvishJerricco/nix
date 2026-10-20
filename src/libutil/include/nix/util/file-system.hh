@@ -537,6 +537,8 @@ void tryUnlink(const std::filesystem::path & path);
  * Atomically replaces the destination if it exists. Does not follow symlinks if
  * dst is a symlink.
  */
+void movePathAt(
+    Descriptor srcfd, const std::filesystem::path & src, Descriptor dstfd, const std::filesystem::path & dst);
 void movePath(const std::filesystem::path & src, const std::filesystem::path & dst);
 
 /**

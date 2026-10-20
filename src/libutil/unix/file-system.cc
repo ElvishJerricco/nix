@@ -297,70 +297,69 @@ void chown(const std::filesystem::path & path, uid_t owner, gid_t group)
         throw SysError("changing ownership of %s", PathFmt(path));
 }
 
-void movePath(const std::filesystem::path & src, const std::filesystem::path & dst)
+void movePathAt(
+    Descriptor srcfd, const std::filesystem::path & src, Descriptor dstfd, const std::filesystem::path & dst)
 {
-    /* If we have O_PATH (Linux, FreeBSD), then we can open the to-be-renamed
-       file without requiring any permissions and "pin" the inode that we'll
-       fchmod. This avoids operating on paths, which is prone to TOCTOU. */
-#ifdef O_PATH
-    AutoCloseFD fd = ::open(src.c_str(), O_NOFOLLOW | O_CLOEXEC | O_PATH);
-    if (!fd)
-        throw SysError("failed to open file %1%", PathFmt(src));
+    struct ModeGuard
+    {
+        AutoCloseFD fd;
+        struct stat st;
+        ModeGuard(ModeGuard &&) = default;
+        ModeGuard & operator=(ModeGuard &&) = default;
+        ModeGuard(AutoCloseFD fd, struct stat st)
+            : fd(std::move(fd))
+            , st(st) {};
 
-    auto changePermsOnFile = [&](mode_t newMode) -> int {
-        /* AT_EMPTY_PATH here is supported since 6.6, but reports EINVAL without fchmodat2. */
-        if (::fchmodat(fd.get(), "", newMode, AT_EMPTY_PATH) == 0)
-            return 0;
+        ~ModeGuard()
+        {
+            try {
+                reset();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+        };
 
-#  ifdef __linux__
-        if (errno == EINVAL) {
-            auto path = fmt("/proc/self/fd/%d", fd.get());
-            if (::chmod(path.c_str(), newMode) == 0)
-                return 0;
-        }
-#  endif
-
-        return -1;
+        void reset()
+        {
+            if (fd && ::fchmod(fd.get(), st.st_mode) == -1) {
+                fd.close();
+                throw SysError("setting permissions on %s", PathFmt(descriptorToPath(fd.get())));
+            }
+            fd.close();
+        };
     };
 
-    const PosixStat st = nix::fstat(fd.get());
-#else
-    const PosixStat st = nix::lstat(src);
-#endif
+    const PosixStat st = nix::fstatat(srcfd, src);
 
-    bool changePerm = (::geteuid() && S_ISDIR(st.st_mode) && !(st.st_mode & S_IWUSR));
-    if (changePerm) {
-        const mode_t newMode = st.st_mode | S_IWUSR;
-#ifdef O_PATH
-        if (changePermsOnFile(newMode) == -1)
-            throw SysError("making %s writable for renaming", PathFmt(src));
-#else
-        nix::chmod(src, newMode);
-#endif
+    std::optional<ModeGuard> modeGuard;
+    if (::geteuid() && S_ISDIR(st.st_mode) && !(st.st_mode & S_IWUSR)) {
+        // We only need to open a file descriptor because we need to
+        // change the mode back after making it writable and won't be
+        // sure which path it will be at (plus the destination is not
+        // necessarily safely owned). But if we don't have read
+        // permission, we can't open the file. Since we only need the
+        // FD because we're changing the mode anyway, we can just add
+        // the readable bit too. That way we don't need anything like
+        // O_PATH and the portability issues that come with it.
+        if (::fchmodat(srcfd, src.c_str(), st.st_mode | S_IRUSR | S_IWUSR, AT_SYMLINK_NOFOLLOW) == -1)
+            throw SysError("getting status of %s", PathFmt(descriptorToPath(srcfd) / src));
+        auto fd = ::openat(srcfd, src.c_str(), O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
+        if (!fd)
+            throw SysError("opening %s", PathFmt(descriptorToPath(srcfd) / src));
+        modeGuard = ModeGuard(std::move(fd), st);
     }
 
-    if (::rename(src.c_str(), dst.c_str()) == -1) {
-        const int savedErrno = errno;
-        if (changePerm) {
-            /* Ignore all errors on restoring permissions. We want to throw the
-               original error originating from ::rename. */
-#ifdef O_PATH
-            changePermsOnFile(st.st_mode);
-#else
-            ::chmod(src.c_str(), st.st_mode);
-#endif
-        }
-        throw SysError(savedErrno, "renaming %1% to %2%", PathFmt(src), PathFmt(dst));
-    }
+    if (::renameat(srcfd, src.c_str(), dstfd, dst.c_str()) == -1)
+        throw SysError(
+            "renaming %1% to %2%", PathFmt(descriptorToPath(srcfd) / src), PathFmt(descriptorToPath(dstfd) / dst));
 
-    if (changePerm) {
-#ifdef O_PATH
-        if (changePermsOnFile(st.st_mode) == -1)
-            throw SysError("restoring permissions on %s", PathFmt(dst));
-#else
-        nix::chmod(dst, st.st_mode);
-#endif
-    }
+    if (modeGuard)
+        modeGuard->reset();
+}
+
+void movePath(const std::filesystem::path & src, const std::filesystem::path & dst)
+{
+    movePathAt(AT_FDCWD, src, AT_FDCWD, dst);
 }
 
 void renameFile(const std::filesystem::path & src, const std::filesystem::path & dst)

@@ -308,7 +308,6 @@ PosixStat fstat(Descriptor fd)
 
 PosixStat fstatat(Descriptor dirFd, const std::filesystem::path & path)
 {
-    assert(path.is_relative());
     assert(!path.empty());
     PosixStat st;
     if (::fstatat(dirFd, path.c_str(), &st, AT_SYMLINK_NOFOLLOW)) {
