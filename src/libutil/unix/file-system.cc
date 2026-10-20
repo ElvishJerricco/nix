@@ -50,6 +50,8 @@ AutoCloseFD openNewFileForWrite(const std::filesystem::path & path, mode_t mode,
 
 std::filesystem::path descriptorToPath(Descriptor fd)
 {
+    if (fd == AT_FDCWD)
+        return std::filesystem::current_path();
     if (fd == STDIN_FILENO)
         return "<stdin>";
     if (fd == STDOUT_FILENO)
@@ -297,8 +299,77 @@ void chown(const std::filesystem::path & path, uid_t owner, gid_t group)
         throw SysError("changing ownership of %s", PathFmt(path));
 }
 
-void movePathAt(
-    Descriptor srcfd, const std::filesystem::path & src, Descriptor dstfd, const std::filesystem::path & dst)
+SemiOwnedPath SemiOwnedPath::unsafeMakeSemiOwnedPath(std::shared_ptr<AutoCloseFD> dirfd, std::filesystem::path path)
+{
+    return SemiOwnedPath(
+        std::move(dirfd),
+        path.has_filename() ? path : path.parent_path() // remove trailing slash, unless it's the root dir
+    );
+}
+
+static void takeOne(Descriptor dirfd, const std::filesystem::path & path)
+{
+    auto st = fstatat(dirfd, path);
+    if (S_ISLNK(st.st_mode)) {
+        throw Error("attempted to traverse symbolic link %s", PathFmt(descriptorToPath(dirfd) / path));
+    }
+    if (st.st_uid != geteuid() || st.st_gid != getegid()) {
+        if (::fchownat(dirfd, path.c_str(), geteuid(), getegid(), AT_SYMLINK_NOFOLLOW) == -1)
+            throw SysError("setting owner on %s", PathFmt(descriptorToPath(dirfd) / path));
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        if (::fchmodat(dirfd, path.c_str(), st.st_mode & ~(S_IWGRP | S_IWOTH), AT_SYMLINK_NOFOLLOW) == -1)
+            throw SysError("setting permissions on %s", PathFmt(descriptorToPath(dirfd) / path));
+    }
+}
+
+SemiOwnedPath SemiOwnedPath::makeSemiOwnedPath(std::shared_ptr<AutoCloseFD> dirfd, std::filesystem::path path)
+{
+    assert(dirfd);
+    auto st = fstat(dirfd->get());
+    assert(S_ISDIR(st.st_mode));
+    takeOne(dirfd->get(), ".");
+    auto it = path.begin();
+    if (it == path.end() || it->is_absolute() || !it->has_filename())
+        throw Error("invalid path %s", PathFmt(path));
+    SemiOwnedPath ownedPath(dirfd, *it);
+    it++;
+    for (; it != path.end(); ++it) {
+        ownedPath.take(*it);
+    }
+    return ownedPath;
+}
+
+SemiOwnedPath SemiOwnedPath::unsafeTake(std::filesystem::path path)
+{
+    std::filesystem::path newBase = this->path_;
+    for (auto component : path) {
+        if (component.is_absolute() || !component.has_filename()) {
+            throw Error("invalid path %s", PathFmt(path));
+        }
+        // skip just the initial check
+        if (newBase != this->path_) {
+            takeOne(dirfd(), newBase);
+        }
+        newBase /= component;
+    }
+    return SemiOwnedPath(dirfd_, newBase);
+}
+
+SemiOwnedPath SemiOwnedPath::take(std::filesystem::path path)
+{
+    std::filesystem::path newBase = this->path_;
+    for (auto component : path) {
+        if (component.is_absolute() || !component.has_filename()) {
+            throw Error("invalid path %s", PathFmt(path));
+        }
+        takeOne(dirfd(), newBase);
+        newBase /= component;
+    }
+    return SemiOwnedPath(dirfd_, newBase);
+}
+
+void movePathAt(const SemiOwnedPath & src, Descriptor dstfd, const std::filesystem::path & dst)
 {
     struct ModeGuard
     {
@@ -329,7 +400,7 @@ void movePathAt(
         };
     };
 
-    const PosixStat st = nix::fstatat(srcfd, src);
+    const PosixStat st = nix::fstatat(src.dirfd(), src.path());
 
     std::optional<ModeGuard> modeGuard;
     if (::geteuid() && S_ISDIR(st.st_mode) && !(st.st_mode & S_IWUSR)) {
@@ -341,17 +412,16 @@ void movePathAt(
         // FD because we're changing the mode anyway, we can just add
         // the readable bit too. That way we don't need anything like
         // O_PATH and the portability issues that come with it.
-        if (::fchmodat(srcfd, src.c_str(), st.st_mode | S_IRUSR | S_IWUSR, AT_SYMLINK_NOFOLLOW) == -1)
-            throw SysError("getting status of %s", PathFmt(descriptorToPath(srcfd) / src));
-        auto fd = ::openat(srcfd, src.c_str(), O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
+        if (::fchmodat(src.dirfd(), src.path().c_str(), st.st_mode | S_IRUSR | S_IWUSR, AT_SYMLINK_NOFOLLOW) == -1)
+            throw SysError("getting status of %s", src.pathfmt());
+        auto fd = ::openat(src.dirfd(), src.path().c_str(), O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
         if (!fd)
-            throw SysError("opening %s", PathFmt(descriptorToPath(srcfd) / src));
+            throw SysError("opening %s", src.pathfmt());
         modeGuard = ModeGuard(std::move(fd), st);
     }
 
-    if (::renameat(srcfd, src.c_str(), dstfd, dst.c_str()) == -1)
-        throw SysError(
-            "renaming %1% to %2%", PathFmt(descriptorToPath(srcfd) / src), PathFmt(descriptorToPath(dstfd) / dst));
+    if (::renameat(src.dirfd(), src.path().c_str(), dstfd, dst.c_str()) == -1)
+        throw SysError("renaming %1% to %2%", src.pathfmt(), PathFmt(dst));
 
     if (modeGuard)
         modeGuard->reset();
@@ -359,7 +429,13 @@ void movePathAt(
 
 void movePath(const std::filesystem::path & src, const std::filesystem::path & dst)
 {
-    movePathAt(AT_FDCWD, src, AT_FDCWD, dst);
+    // This is obviously illegal and the type needs to be propagated,
+    // but it demonstrates the kind of thing you can do when you're
+    // aware of the safety semantics: The function being called does
+    // not need any sort of gymnastics to accept a path that might
+    // ordinarily be unsafe in the RESOLVE_BENEATH sense, like an
+    // absolute path or a path that traverses symlinks.
+    movePathAt(SemiOwnedPath::unsafeMakeSemiOwnedPath(nullptr, src), AT_FDCWD, dst);
 }
 
 void renameFile(const std::filesystem::path & src, const std::filesystem::path & dst)

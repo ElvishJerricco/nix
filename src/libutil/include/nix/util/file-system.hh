@@ -529,6 +529,68 @@ void unlinkIfExists(const std::filesystem::path & path);
 void tryUnlink(const std::filesystem::path & path);
 
 /**
+ * A type for paths that were known to be owned by the current user,
+ * up to but excluding its last component. These are short-lived
+ * values. They help to ensure that you have taken ownership over
+ * paths, but do not maintain that ownership for the future; if
+ * another user chowns them, this type will not catch that. This type
+ * does, however, help with TOCTOU issues, because it proves to
+ * functions using it in their parameters that their callers have been
+ * required to fulfill safe path ownership. This includes symlink
+ * traversal during path resolution; this type's safe API will not
+ * traverse symlinks at all unless the caller explicitly uses the
+ * unsafe API, which makes them responsible for the risks of symlink
+ * traversal (note that RESOLVE_BENEATH semantics are *not*
+ * necessarily safe for symlink traversal, since you can still
+ * traverse into unowned directories). This type only represents
+ * ownership up to the immediate parent of the named file because path
+ * safety is only concerned with the ancestral linkage between
+ * components, not the target file itself. The target may also not
+ * exist, in which case it is still important to own the parent when
+ * putting a new file there.
+ */
+class SemiOwnedPath
+{
+    /**
+     * The directory FD the path is relative to. If nullptr, it represents AT_FDCWD
+     */
+    std::shared_ptr<AutoCloseFD> dirfd_;
+    /**
+     * The path referring to a file, relative to the directory
+     * FD. Must be non-empty and must have a file name. May be
+     * absolute, in which case the directory FD is ignored.
+     */
+    std::filesystem::path path_;
+    SemiOwnedPath(std::shared_ptr<AutoCloseFD> dirfd, std::filesystem::path path)
+        : dirfd_(std::move(dirfd))
+        , path_(std::move(path)) {};
+
+public:
+    static SemiOwnedPath unsafeMakeSemiOwnedPath(std::shared_ptr<AutoCloseFD> dirfd, std::filesystem::path path);
+
+    static SemiOwnedPath makeSemiOwnedPath(std::shared_ptr<AutoCloseFD> dirfd, std::filesystem::path path);
+
+    SemiOwnedPath unsafeTake(std::filesystem::path path);
+
+    SemiOwnedPath take(std::filesystem::path path);
+
+    Descriptor dirfd() const
+    {
+        return dirfd_ ? dirfd_->get() : AT_FDCWD;
+    };
+
+    const std::filesystem::path path() const
+    {
+        return path_;
+    };
+
+    const PathFmt pathfmt() const
+    {
+        return PathFmt(descriptorToPath(dirfd()) / path());
+    };
+};
+
+/**
  * @brief Move/rename path 'src' to 'dst'.
  *
  * Temporarily makes 'src' writable if it's a directory and we're not root (to
@@ -536,9 +598,12 @@ void tryUnlink(const std::filesystem::path & path);
  *
  * Atomically replaces the destination if it exists. Does not follow symlinks if
  * dst is a symlink.
+ *
+ * The destination is not a SemiOwnedPath because this function does
+ * not rely on safe path ownership for the destination.
  */
-void movePathAt(
-    Descriptor srcfd, const std::filesystem::path & src, Descriptor dstfd, const std::filesystem::path & dst);
+void movePathAt(const SemiOwnedPath & src, Descriptor dstfd, const std::filesystem::path & dst);
+// TODO: safe path ownership
 void movePath(const std::filesystem::path & src, const std::filesystem::path & dst);
 
 /**
